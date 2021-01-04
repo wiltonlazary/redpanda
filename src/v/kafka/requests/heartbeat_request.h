@@ -11,7 +11,6 @@
 
 #pragma once
 #include "kafka/errors.h"
-#include "kafka/requests/request_context.h"
 #include "kafka/requests/response.h"
 #include "kafka/requests/schemata/heartbeat_request.h"
 #include "kafka/requests/schemata/heartbeat_response.h"
@@ -23,7 +22,11 @@
 
 namespace kafka {
 
+struct heartbeat_response;
+
 struct heartbeat_api final {
+    using response_type = heartbeat_response;
+
     static constexpr const char* name = "heartbeat";
     static constexpr api_key key = api_key(12);
     static constexpr api_version min_supported = api_version(0);
@@ -34,6 +37,8 @@ struct heartbeat_api final {
 };
 
 struct heartbeat_request final {
+    using api_type = heartbeat_api;
+
     heartbeat_request_data data;
 
     // set during request processing after mapping group to ntp
@@ -57,6 +62,8 @@ struct heartbeat_response final {
 
     heartbeat_response_data data;
 
+    heartbeat_response() = default;
+
     explicit heartbeat_response(error_code error)
       : data({
         .throttle_time_ms = std::chrono::milliseconds(0),
@@ -66,13 +73,14 @@ struct heartbeat_response final {
     heartbeat_response(const heartbeat_request&, error_code error)
       : heartbeat_response(error) {}
 
-    void encode(const request_context& ctx, response& resp) {
-        data.encode(resp.writer(), ctx.header().version);
+    void encode(const request_context&, response&);
+
+    void decode(iobuf buf, api_version version) {
+        data.decode(std::move(buf), version);
     }
 };
 
-static inline ss::future<heartbeat_response>
-make_heartbeat_error(error_code error) {
+inline ss::future<heartbeat_response> make_heartbeat_error(error_code error) {
     return ss::make_ready_future<heartbeat_response>(error);
 }
 

@@ -11,7 +11,6 @@
 
 #pragma once
 #include "kafka/errors.h"
-#include "kafka/requests/request_context.h"
 #include "kafka/requests/response.h"
 #include "kafka/requests/schemata/join_group_request.h"
 #include "kafka/requests/schemata/join_group_response.h"
@@ -25,7 +24,11 @@
 
 namespace kafka {
 
+struct join_group_response;
+
 struct join_group_api final {
+    using response_type = join_group_response;
+
     static constexpr const char* name = "join group";
     static constexpr api_key key = api_key(11);
     static constexpr api_version min_supported = api_version(0);
@@ -36,6 +39,8 @@ struct join_group_api final {
 };
 
 struct join_group_request final {
+    using api_type = join_group_api;
+
     join_group_request_data data;
 
     join_group_request() = default;
@@ -91,11 +96,13 @@ struct join_group_response final {
 
     join_group_response_data data;
 
+    join_group_response() = default;
+
     join_group_response(kafka::member_id member_id, kafka::error_code error)
       : join_group_response(
         error, no_generation, no_protocol, no_leader, member_id) {}
 
-    join_group_response(kafka::error_code error)
+    explicit join_group_response(kafka::error_code error)
       : join_group_response(no_member, error) {}
 
     join_group_response(const join_group_request& r, kafka::error_code error)
@@ -117,18 +124,20 @@ struct join_group_response final {
         data.members = std::move(members);
     }
 
-    void encode(const request_context& ctx, response& resp) {
-        data.encode(resp.writer(), ctx.header().version);
+    void encode(const request_context&, response&);
+
+    void decode(iobuf buf, api_version version) {
+        data.decode(std::move(buf), version);
     }
 };
 
-static inline join_group_response
+inline join_group_response
 _make_join_error(kafka::member_id member_id, error_code error) {
     return join_group_response(
       error, no_generation, no_protocol, no_leader, std::move(member_id));
 }
 
-static inline ss::future<join_group_response>
+inline ss::future<join_group_response>
 make_join_error(kafka::member_id member_id, error_code error) {
     return ss::make_ready_future<join_group_response>(
       _make_join_error(std::move(member_id), error));
@@ -141,7 +150,7 @@ operator<<(std::ostream& os, const join_group_response& r) {
 
 // group membership helper to compare a protocol set from the wire with our
 // internal type without doing a full type conversion.
-static inline bool operator==(
+inline bool operator==(
   const std::vector<join_group_request_protocol>& a,
   const std::vector<member_protocol>& b) {
     return std::equal(
@@ -156,7 +165,7 @@ static inline bool operator==(
 
 // group membership helper to compare a protocol set from the wire with our
 // internal type without doing a full type conversion.
-static inline bool operator!=(
+inline bool operator!=(
   const std::vector<join_group_request_protocol>& a,
   const std::vector<member_protocol>& b) {
     return !(a == b);

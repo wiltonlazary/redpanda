@@ -32,28 +32,28 @@ import (
 )
 
 type result struct {
-	name      string
-	applied   bool
-	enabled   bool
-	supported bool
-	errMsg    string
+	name		string
+	applied		bool
+	enabled		bool
+	supported	bool
+	errMsg		string
 }
 
 func NewTuneCommand(fs afero.Fs, mgr config.Manager) *cobra.Command {
 	tunerParams := factory.TunerParams{}
 	var (
-		configFile        string
-		outTuneScriptFile string
-		cpuSet            string
-		timeout           time.Duration
-		interactive       bool
+		configFile		string
+		outTuneScriptFile	string
+		cpuSet			string
+		timeout			time.Duration
+		interactive		bool
 	)
 	baseMsg := "Sets the OS parameters to tune system performance." +
 		" Available tuners: all, " +
 		strings.Join(factory.AvailableTuners(), ", ")
 	command := &cobra.Command{
-		Use:   "tune <list of elements to tune>",
-		Short: baseMsg,
+		Use:	"tune <list of elements to tune>",
+		Short:	baseMsg,
 		Long: baseMsg + ".\n In order to get more information about the" +
 			" tuners, run `rpk tune help <tuner name>`",
 		Args: func(cmd *cobra.Command, args []string) error {
@@ -107,7 +107,6 @@ Would you like to continue with the default configuration?`,
 				}
 				conf = config.Default()
 			}
-			config.CheckAndPrintNotice(conf.LicenseKey)
 			var tunerFactory factory.TunersFactory
 			if outTuneScriptFile != "" {
 				tunerFactory = factory.NewScriptRenderingTunersFactory(

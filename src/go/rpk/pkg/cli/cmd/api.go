@@ -29,12 +29,12 @@ import (
 
 func NewApiCommand(fs afero.Fs, mgr config.Manager) *cobra.Command {
 	var (
-		brokers    []string
-		configFile string
+		brokers		[]string
+		configFile	string
 	)
 	command := &cobra.Command{
-		Use:   "api",
-		Short: "Interact with the Redpanda API",
+		Use:	"api",
+		Short:	"Interact with the Redpanda API",
 	}
 
 	command.PersistentFlags().StringSliceVar(
@@ -98,9 +98,7 @@ func findConfigFile(
 			return conf, nil
 		}
 		conf, err = mgr.ReadOrFind(*configFile)
-		if err == nil {
-			config.CheckAndPrintNotice(conf.LicenseKey)
-		} else {
+		if err != nil {
 			log.Debug(err)
 			if os.IsNotExist(err) && *configFile == "" {
 				log.Debug(

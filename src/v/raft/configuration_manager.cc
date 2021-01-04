@@ -122,7 +122,7 @@ configuration_manager::add(model::offset offset, group_configuration cfg) {
     });
 }
 
-group_configuration configuration_manager::get_latest() const {
+const group_configuration& configuration_manager::get_latest() const {
     vassert(
       !_configurations.empty(),
       "Configuration manager should always have at least one configuration");
@@ -229,7 +229,18 @@ ss::future<> configuration_manager::stop() {
     return ss::now();
 }
 
-ss::future<> configuration_manager::start() {
+ss::future<> configuration_manager::start(bool reset) {
+    if (reset) {
+        return _storage.kvs()
+          .remove(
+            storage::kvstore::key_space::consensus, configurations_map_key())
+          .then([this] {
+              return _storage.kvs().remove(
+                storage::kvstore::key_space::consensus,
+                highest_known_offset_key());
+          });
+    }
+
     auto map_buf = _storage.kvs().get(
       storage::kvstore::key_space::consensus, configurations_map_key());
     return _lock.with([this, map_buf = std::move(map_buf)]() mutable {

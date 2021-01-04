@@ -22,22 +22,21 @@ import (
 
 func NewIoTuneCmd(fs afero.Fs, mgr config.Manager) *cobra.Command {
 	var (
-		configFile  string
-		outputFile  string
-		duration    time.Duration
-		directories []string
-		timeout     time.Duration
+		configFile	string
+		outputFile	string
+		duration	time.Duration
+		directories	[]string
+		timeout		time.Duration
 	)
 	command := &cobra.Command{
-		Use:   "iotune",
-		Short: "Measure filesystem performance and create IO configuration file",
+		Use:	"iotune",
+		Short:	"Measure filesystem performance and create IO configuration file",
 		RunE: func(ccmd *cobra.Command, args []string) error {
 			timeout += duration
 			conf, err := mgr.FindOrGenerate(configFile)
 			if err != nil {
 				return err
 			}
-			config.CheckAndPrintNotice(conf.LicenseKey)
 			var evalDirectories []string
 			if directories != nil && len(directories) != 0 {
 				log.Infof("Overriding evaluation directories with '%v'",

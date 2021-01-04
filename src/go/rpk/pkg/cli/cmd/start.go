@@ -37,70 +37,71 @@ import (
 )
 
 type prestartConfig struct {
-	tuneEnabled  bool
-	checkEnabled bool
+	tuneEnabled	bool
+	checkEnabled	bool
 }
 
 type seastarFlags struct {
-	memory           string
-	lockMemory       bool
-	reserveMemory    string
-	hugepages        string
-	cpuSet           string
-	ioPropertiesFile string
-	ioProperties     string
-	smp              int
-	threadAffinity   bool
-	numIoQueues      int
-	maxIoRequests    int
-	mbind            bool
-	overprovisioned  bool
+	memory			string
+	lockMemory		bool
+	reserveMemory		string
+	hugepages		string
+	cpuSet			string
+	ioPropertiesFile	string
+	ioProperties		string
+	smp			int
+	threadAffinity		bool
+	numIoQueues		int
+	maxIoRequests		int
+	mbind			bool
+	overprovisioned		bool
 }
 
 const (
-	memoryFlag           = "memory"
-	lockMemoryFlag       = "lock-memory"
-	reserveMemoryFlag    = "reserve-memory"
-	hugepagesFlag        = "hugepages"
-	cpuSetFlag           = "cpuset"
-	ioPropertiesFileFlag = "io-properties-file"
-	ioPropertiesFlag     = "io-properties"
-	wellKnownIOFlag      = "well-known-io"
-	smpFlag              = "smp"
-	threadAffinityFlag   = "thread-affinity"
-	numIoQueuesFlag      = "num-io-queues"
-	maxIoRequestsFlag    = "max-io-requests"
-	mbindFlag            = "mbind"
-	overprovisionedFlag  = "overprovisioned"
+	memoryFlag		= "memory"
+	lockMemoryFlag		= "lock-memory"
+	reserveMemoryFlag	= "reserve-memory"
+	hugepagesFlag		= "hugepages"
+	cpuSetFlag		= "cpuset"
+	ioPropertiesFileFlag	= "io-properties-file"
+	ioPropertiesFlag	= "io-properties"
+	wellKnownIOFlag		= "well-known-io"
+	smpFlag			= "smp"
+	threadAffinityFlag	= "thread-affinity"
+	numIoQueuesFlag		= "num-io-queues"
+	maxIoRequestsFlag	= "max-io-requests"
+	mbindFlag		= "mbind"
+	overprovisionedFlag	= "overprovisioned"
 
-	seedFormat = "<host>[:<port>]+<id>"
+	seedFormat	= "<host>[:<port>]+<id>"
 )
 
-func NewStartCommand(fs afero.Fs, mgr config.Manager) *cobra.Command {
+func NewStartCommand(
+	fs afero.Fs, mgr config.Manager, launcher redpanda.Launcher,
+) *cobra.Command {
 	prestartCfg := prestartConfig{}
 	var (
-		configFile      string
-		nodeID          uint
-		seeds           []string
-		kafkaAddr       string
-		rpcAddr         string
-		advertisedKafka string
-		advertisedRPC   string
-		installDirFlag  string
-		timeout         time.Duration
-		wellKnownIo     string
+		configFile	string
+		nodeID		uint
+		seeds		[]string
+		kafkaAddr	string
+		rpcAddr		string
+		advertisedKafka	string
+		advertisedRPC	string
+		installDirFlag	string
+		timeout		time.Duration
+		wellKnownIo	string
 	)
 	sFlags := seastarFlags{}
 
 	command := &cobra.Command{
-		Use:   "start",
-		Short: "Start redpanda",
+		Use:	"start",
+		Short:	"Start redpanda",
 		RunE: func(ccmd *cobra.Command, args []string) error {
 			conf, err := mgr.FindOrGenerate(configFile)
 			if err != nil {
 				return err
 			}
-			config.CheckAndPrintNotice(conf.LicenseKey)
 			env := api.EnvironmentPayload{}
 			if len(seeds) == 0 {
 				// If --seeds wasn't passed, fall back to the
@@ -126,7 +127,10 @@ func NewStartCommand(fs afero.Fs, mgr config.Manager) *cobra.Command {
 				kafkaAddr,
 				os.Getenv("REDPANDA_KAFKA_ADDRESS"),
 			)
-			kafkaApi, err := parseAddress(kafkaAddr)
+			kafkaApi, err := parseAddress(
+				kafkaAddr,
+				config.Default().Redpanda.KafkaApi.Port,
+			)
 			if err != nil {
 				sendEnv(mgr, env, conf, err)
 				return err
@@ -139,7 +143,10 @@ func NewStartCommand(fs afero.Fs, mgr config.Manager) *cobra.Command {
 				rpcAddr,
 				os.Getenv("REDPANDA_RPC_ADDRESS"),
 			)
-			rpcServer, err := parseAddress(rpcAddr)
+			rpcServer, err := parseAddress(
+				rpcAddr,
+				config.Default().Redpanda.RPCServer.Port,
+			)
 			if err != nil {
 				sendEnv(mgr, env, conf, err)
 				return err
@@ -152,7 +159,10 @@ func NewStartCommand(fs afero.Fs, mgr config.Manager) *cobra.Command {
 				advertisedKafka,
 				os.Getenv("REDPANDA_ADVERTISE_KAFKA_ADDRESS"),
 			)
-			advKafkaApi, err := parseAddress(advertisedKafka)
+			advKafkaApi, err := parseAddress(
+				advertisedKafka,
+				config.Default().Redpanda.KafkaApi.Port,
+			)
 			if err != nil {
 				sendEnv(mgr, env, conf, err)
 				return err
@@ -164,7 +174,10 @@ func NewStartCommand(fs afero.Fs, mgr config.Manager) *cobra.Command {
 				advertisedRPC,
 				os.Getenv("REDPANDA_ADVERTISE_RPC_ADDRESS"),
 			)
-			advRPCApi, err := parseAddress(advertisedRPC)
+			advRPCApi, err := parseAddress(
+				advertisedRPC,
+				config.Default().Redpanda.RPCServer.Port,
+			)
 			if err != nil {
 				sendEnv(mgr, env, conf, err)
 				return err
@@ -209,10 +222,9 @@ func NewStartCommand(fs afero.Fs, mgr config.Manager) *cobra.Command {
 
 			sendEnv(mgr, env, conf, nil)
 			rpArgs.ExtraArgs = args
-			launcher := redpanda.NewLauncher(installDirectory, rpArgs)
 			log.Info(feedbackMsg)
 			log.Info("Starting redpanda...")
-			return launcher.Start()
+			return launcher.Start(installDirectory, rpArgs)
 		},
 	}
 	command.Flags().StringVar(
@@ -329,19 +341,19 @@ func NewStartCommand(fs afero.Fs, mgr config.Manager) *cobra.Command {
 
 func flagsMap(sFlags seastarFlags) map[string]interface{} {
 	return map[string]interface{}{
-		memoryFlag:           sFlags.memory,
-		lockMemoryFlag:       sFlags.lockMemory,
-		reserveMemoryFlag:    sFlags.reserveMemory,
-		ioPropertiesFileFlag: sFlags.ioPropertiesFile,
-		ioPropertiesFlag:     sFlags.ioProperties,
-		cpuSetFlag:           sFlags.cpuSet,
-		smpFlag:              sFlags.smp,
-		hugepagesFlag:        sFlags.hugepages,
-		threadAffinityFlag:   sFlags.threadAffinity,
-		numIoQueuesFlag:      sFlags.numIoQueues,
-		maxIoRequestsFlag:    sFlags.maxIoRequests,
-		mbindFlag:            sFlags.mbind,
-		overprovisionedFlag:  sFlags.overprovisioned,
+		memoryFlag:		sFlags.memory,
+		lockMemoryFlag:		sFlags.lockMemory,
+		reserveMemoryFlag:	sFlags.reserveMemory,
+		ioPropertiesFileFlag:	sFlags.ioPropertiesFile,
+		ioPropertiesFlag:	sFlags.ioProperties,
+		cpuSetFlag:		sFlags.cpuSet,
+		smpFlag:		sFlags.smp,
+		hugepagesFlag:		sFlags.hugepages,
+		threadAffinityFlag:	sFlags.threadAffinity,
+		numIoQueuesFlag:	sFlags.numIoQueues,
+		maxIoRequestsFlag:	sFlags.maxIoRequests,
+		mbindFlag:		sFlags.mbind,
+		overprovisionedFlag:	sFlags.overprovisioned,
 	}
 }
 
@@ -413,7 +425,7 @@ func buildRedpandaFlags(
 		}
 	}
 	flagsMap := flagsMap(sFlags)
-	for flag, _ := range flagsMap {
+	for flag := range flagsMap {
 		if !flags.Changed(flag) {
 			delete(flagsMap, flag)
 		}
@@ -424,8 +436,8 @@ func buildRedpandaFlags(
 		finalFlags[n] = fmt.Sprint(v)
 	}
 	return &redpanda.RedpandaArgs{
-		ConfigFilePath: conf.ConfigFile,
-		SeastarFlags:   finalFlags,
+		ConfigFilePath:	conf.ConfigFile,
+		SeastarFlags:	finalFlags,
 	}, nil
 }
 
@@ -529,9 +541,9 @@ func tuneAll(
 		tuner := tunerFactory.CreateTuner(tunerName, params)
 		supported, reason := tuner.CheckIfSupported()
 		payload := api.TunerPayload{
-			Name:      tunerName,
-			Enabled:   enabled,
-			Supported: supported,
+			Name:		tunerName,
+			Enabled:	enabled,
+			Supported:	supported,
 		}
 		if !enabled {
 			log.Infof("Skipping disabled tuner %s", tunerName)
@@ -580,9 +592,9 @@ func check(
 	}
 	for _, result := range results {
 		payload := api.CheckPayload{
-			Name:     result.Desc,
-			Current:  result.Current,
-			Required: result.Required,
+			Name:		result.Desc,
+			Current:	result.Current,
+			Required:	result.Required,
 		}
 		if result.Err != nil {
 			payload.ErrorMsg = result.Err.Error()
@@ -669,7 +681,10 @@ func parseSeeds(seeds []string) ([]config.SeedServer, error) {
 				s,
 			)
 		}
-		addr, err := parseAddress(addressID[0])
+		addr, err := parseAddress(
+			addressID[0],
+			config.Default().Redpanda.RPCServer.Port,
+		)
 		if err != nil {
 			return seedServers, fmt.Errorf(
 				"Couldn't parse seed '%s': %v",
@@ -691,7 +706,7 @@ func parseSeeds(seeds []string) ([]config.SeedServer, error) {
 	return seedServers, nil
 }
 
-func parseAddress(addr string) (*config.SocketAddress, error) {
+func parseAddress(addr string, defaultPort int) (*config.SocketAddress, error) {
 	if addr == "" {
 		return nil, nil
 	}
@@ -701,10 +716,10 @@ func parseAddress(addr string) (*config.SocketAddress, error) {
 		return nil, fmt.Errorf("Empty host in address '%s'", addr)
 	}
 	if len(hostPort) != 2 {
-		// It's just a hostname with no port. Assume 9092.
+		// It's just a hostname with no port. Use the default port.
 		return &config.SocketAddress{
-			Address: strings.Trim(hostPort[0], " "),
-			Port:    config.Default().Redpanda.RPCServer.Port,
+			Address:	strings.Trim(hostPort[0], " "),
+			Port:		defaultPort,
 		}, nil
 	}
 	// It's a host:port combo.
@@ -713,8 +728,8 @@ func parseAddress(addr string) (*config.SocketAddress, error) {
 		return nil, fmt.Errorf("Port must be an int")
 	}
 	return &config.SocketAddress{
-		Address: host,
-		Port:    port,
+		Address:	host,
+		Port:		port,
 	}, nil
 }
 

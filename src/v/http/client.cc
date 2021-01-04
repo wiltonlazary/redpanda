@@ -9,10 +9,23 @@
 
 #include "http/client.h"
 
+#include "bytes/details/io_iterator_consumer.h"
+#include "bytes/iobuf.h"
+
+#include <seastar/core/condition-variable.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/iostream.hh>
 #include <seastar/core/loop.hh>
+#include <seastar/core/semaphore.hh>
+#include <seastar/core/temporary_buffer.hh>
+#include <seastar/core/timer.hh>
 
 #include <boost/beast/core/buffer_traits.hpp>
+
+#include <chrono>
+#include <exception>
+#include <limits>
+#include <stdexcept>
 
 namespace http {
 
@@ -25,7 +38,6 @@ ss::future<client::request_response_t>
 client::make_request(client::request_header&& header) {
     vlog(http_log.trace, "client.make_request {}", header);
     auto req = ss::make_shared<request_stream>(this, std::move(header));
-
     auto res = ss::make_shared<response_stream>(this);
     if (is_valid()) {
         // already connected
@@ -38,12 +50,15 @@ client::make_request(client::request_header&& header) {
     });
 }
 
+ss::future<> client::shutdown() { return stop(); }
+
 // response_stream implementation //
 
 client::response_stream::response_stream(client* client)
   : _client(client)
   , _parser()
   , _buffer() {
+    _parser.body_limit(std::numeric_limits<uint64_t>::max());
     _parser.eager(true);
 }
 
@@ -70,27 +85,21 @@ iobuf_to_constbufseq(const iobuf& iobuf) {
     return seq;
 }
 
-ss::future<iobuf> client::response_stream::recv_some() {
-    return ss::do_with(iobuf(), [this](iobuf& result) {
-        return do_recv_some(result).then([&result]() {
-            return ss::make_ready_future<iobuf>(std::move(result));
-        });
-    });
-}
+ss::future<> client::response_stream::shutdown() { return _client->shutdown(); }
 
 /// Return failed future if ec is set, otherwise return future in ready state
-static ss::future<> fail_on_error(const boost::beast::error_code& ec) {
+static ss::future<iobuf> fail_on_error(const boost::beast::error_code& ec) {
     if (!ec) {
-        return ss::make_ready_future<>();
+        return ss::make_ready_future<iobuf>(iobuf());
     }
     vlog(http_log.error, "'{}' error triggered", ec);
     boost::system::system_error except(ec);
-    return ss::make_exception_future<>(except);
+    return ss::make_exception_future<iobuf>(except);
 }
 
-ss::future<> client::response_stream::do_recv_some(iobuf& result) {
+ss::future<iobuf> client::response_stream::recv_some() {
     return _client->_in.read().then(
-      [this, &result](ss::temporary_buffer<char> chunk) mutable {
+      [this](ss::temporary_buffer<char> chunk) mutable {
           vlog(http_log.trace, "chunk received, chunk length {}", chunk.size());
           if (chunk.empty()) {
               // NOTE: to make the parser stop we need to use the 'put_eof'
@@ -104,6 +113,7 @@ ss::future<> client::response_stream::do_recv_some(iobuf& result) {
               return fail_on_error(ec);
           }
           _buffer.append(std::move(chunk));
+          _parser.get().body().set_temporary_source(_buffer);
           // Feed the parser
           if (_parser.is_done()) {
               vlog(
@@ -112,22 +122,20 @@ ss::future<> client::response_stream::do_recv_some(iobuf& result) {
                 _buffer.size_bytes());
               // this is an error, shouldn't get here if parser is done
               std::runtime_error err("received more data than expected");
-              return ss::make_exception_future<>(err);
+              return ss::make_exception_future<iobuf>(err);
           }
           auto bufseq = iobuf_to_constbufseq(_buffer);
           boost::beast::error_code ec;
           size_t noctets = _parser.put(bufseq, ec);
           if (ec == boost::beast::http::error::need_more) {
-              // The only way to progress for the parser is to add data to
-              // the _buffer which means that we have to read the socket
-              // next
-              vlog(
-                http_log.trace,
-                "need_more, noctents {}, size {}, ec {}",
-                noctets,
-                _buffer.size_bytes(),
-                ec);
-              return ss::make_ready_future<>();
+              // The parser is in the eager mode. This means
+              // that the data will be produced (iobuf_body::value_type::append
+              // will be called) anyway. The parser won't cache any data
+              // internally and produce partial results which is an expected
+              // behaviour. Without eager mode the parser caches partial results
+              // and returns 'need_more'. The data is produced after subsequent
+              // 'put' call(s) is made.
+              ec = {};
           }
           if (ec) {
               // Parser error, response doesn't make sence
@@ -137,12 +145,9 @@ ss::future<> client::response_stream::do_recv_some(iobuf& result) {
                 ec,
                 _buffer.size_bytes());
               _buffer.clear();
-              boost::system::system_error error(ec);
-              return ss::make_exception_future<>(std::move(error));
+              return fail_on_error(ec);
           }
-          auto out = _parser.get().body().consume(_buffer, noctets);
-
-          result.append(std::move(out));
+          auto out = _parser.get().body().consume();
           _buffer.trim_front(noctets);
           if (!_buffer.empty()) {
               vlog(
@@ -151,10 +156,10 @@ ss::future<> client::response_stream::do_recv_some(iobuf& result) {
                 "{}, ec {}",
                 noctets,
                 _buffer.size_bytes(),
-                result.size_bytes(),
+                out.size_bytes(),
                 ec);
           }
-          return ss::make_ready_future<>();
+          return ss::make_ready_future<iobuf>(std::move(out));
       });
 }
 
@@ -188,8 +193,15 @@ struct parser_visitor {
     http_serializer& serializer;
 };
 
+ss::future<>
+client::request_stream::send_some(ss::temporary_buffer<char>&& buf) {
+    iobuf tmp;
+    tmp.append(std::move(buf));
+    return send_some(std::move(tmp));
+}
+
 ss::future<> client::request_stream::send_some(iobuf&& seq) {
-    vlog(http_log.trace, "request_stream.send_sone {}", seq.size_bytes());
+    vlog(http_log.trace, "request_stream.send_some {}", seq.size_bytes());
     if (_serializer.is_header_done()) {
         // Fast path
         return ss::with_gate(_gate, [this, seq = std::move(seq)]() mutable {
@@ -222,5 +234,134 @@ bool client::request_stream::is_done() { return _serializer.is_done(); }
 
 // Wait until remaining data will be transmitted
 ss::future<> client::request_stream::send_eof() { return _gate.close(); }
+
+static ss::temporary_buffer<char> iobuf_as_tmpbuf(iobuf&& buf) {
+    if (buf.begin() == buf.end()) {
+        // empty buf
+        return ss::temporary_buffer<char>();
+    }
+    auto full_size_bytes = buf.size_bytes();
+    if (auto it = buf.begin(); full_size_bytes == it->size()) {
+        // fast path
+        return std::move(*it).release();
+    }
+    // linearize the iobuf
+    auto consumer = iobuf::iterator_consumer(buf.begin(), buf.end());
+    ss::temporary_buffer<char> res(full_size_bytes);
+    consumer.consume_to(full_size_bytes, res.get_write());
+    return res;
+}
+/// Represents response body as a data source for ss::input_stream
+struct response_data_source final : ss::data_source_impl {
+    explicit response_data_source(client::response_stream_ref resp)
+      : _io(std::move(resp)) {}
+    ss::future<> close() final {
+        _done = true;
+        return ss::now();
+    }
+    ss::future<ss::temporary_buffer<char>> skip(uint64_t n) final {
+        _skip += n;
+        return get();
+    }
+    ss::future<ss::temporary_buffer<char>> get() final {
+        return ss::do_with(
+          ss::temporary_buffer<char>(),
+          [this](ss::temporary_buffer<char>& result) {
+              return ss::repeat([this, &result] {
+                         if (_done || _io->is_done()) {
+                             return ss::make_ready_future<ss::stop_iteration>(
+                               ss::stop_iteration::yes);
+                         }
+                         return _io->recv_some().then([this, &result](
+                                                        iobuf&& bufseq) {
+                             if (_skip) {
+                                 auto n = std::min(bufseq.size_bytes(), _skip);
+                                 bufseq.trim_front(n);
+                                 _skip -= n;
+                             }
+                             if (bufseq.begin() == bufseq.end()) {
+                                 return ss::make_ready_future<
+                                   ss::stop_iteration>(
+                                   _io->is_done() ? ss::stop_iteration::yes
+                                                  : ss::stop_iteration::no);
+                             }
+                             result = iobuf_as_tmpbuf(std::move(bufseq));
+                             return ss::make_ready_future<ss::stop_iteration>(
+                               ss::stop_iteration::yes);
+                         });
+                     })
+                .then([&result] {
+                    return ss::make_ready_future<ss::temporary_buffer<char>>(
+                      std::move(result));
+                });
+          });
+    }
+    client::response_stream_ref _io;
+    size_t _skip{0};
+    bool _done{false};
+};
+struct request_data_sink final : ss::data_sink_impl {
+    explicit request_data_sink(client::request_stream_ref req)
+      : _io(std::move(req)) {}
+    ss::future<> put(ss::net::packet data) final { return put(data.release()); }
+    ss::future<> put(std::vector<ss::temporary_buffer<char>> all) final {
+        return ss::do_with(
+          std::move(all), [this](std::vector<ss::temporary_buffer<char>>& all) {
+              return ss::do_for_each(
+                all, [this](ss::temporary_buffer<char>& buf) {
+                    return put(std::move(buf));
+                });
+          });
+    }
+    ss::future<> put(ss::temporary_buffer<char> buf) final {
+        return _io->send_some(std::move(buf));
+    }
+    ss::future<> flush() final { return ss::now(); }
+    ss::future<> close() final { return _io->send_eof(); }
+    client::request_stream_ref _io;
+};
+
+ss::future<client::response_stream_ref> client::request(
+  client::request_header&& header, ss::input_stream<char>& input) {
+    return make_request(std::move(header))
+      .then([&input](request_response_t reqresp) mutable {
+          auto [request, response] = std::move(reqresp);
+          auto fsend = ss::do_with(
+            request->as_output_stream(),
+            [&input](ss::output_stream<char>& output) {
+                return ss::copy(input, output).then([&output] {
+                    return output.close();
+                });
+            });
+          return fsend.then([response = response]() {
+              return ss::make_ready_future<response_stream_ref>(response);
+          });
+      });
+}
+
+ss::future<client::response_stream_ref>
+client::request(client::request_header&& header) {
+    return make_request(std::move(header))
+      .then([](request_response_t reqresp) mutable {
+          auto [request, response] = std::move(reqresp);
+          return request->send_some(iobuf())
+            .then([request = request]() { return request->send_eof(); })
+            .then([response = response] {
+                return ss::make_ready_future<response_stream_ref>(response);
+            });
+      });
+}
+
+ss::output_stream<char> client::request_stream::as_output_stream() {
+    auto ds = ss::data_sink(
+      std::make_unique<request_data_sink>(shared_from_this()));
+    return ss::output_stream<char>(std::move(ds), max_chunk_size);
+}
+
+ss::input_stream<char> client::response_stream::as_input_stream() {
+    auto ds = ss::data_source(
+      std::make_unique<response_data_source>(shared_from_this()));
+    return ss::input_stream<char>(std::move(ds));
+}
 
 } // namespace http

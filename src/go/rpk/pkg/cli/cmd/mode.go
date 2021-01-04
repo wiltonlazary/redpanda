@@ -21,9 +21,9 @@ import (
 func NewModeCommand(mgr config.Manager) *cobra.Command {
 	var configFile string
 	command := &cobra.Command{
-		Use:   "mode <mode>",
-		Short: "Enable a default configuration mode",
-		Long:  "",
+		Use:	"mode <mode>",
+		Short:	"Enable a default configuration mode",
+		Long:	"",
 		Args: func(_ *cobra.Command, args []string) error {
 			if len(args) < 1 {
 				return fmt.Errorf("requires a mode [%s]", strings.Join(config.AvailableModes(), ", "))
@@ -50,7 +50,6 @@ func executeMode(mgr config.Manager, configFile string, mode string) error {
 	if err != nil {
 		return err
 	}
-	config.CheckAndPrintNotice(conf.LicenseKey)
 	conf, err = config.SetMode(mode, conf)
 	if err != nil {
 		return err

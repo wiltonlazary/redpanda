@@ -24,28 +24,29 @@ import (
 	"vectorized/pkg/system"
 
 	"github.com/Shopify/sarama"
+	"github.com/hashicorp/go-multierror"
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/afero"
 	"github.com/spf13/cobra"
 )
 
-type status struct {
-	metrics  *system.Metrics
-	jsonConf string
-	topics   []*sarama.TopicMetadata
+type metricsResult struct {
+	rows	[][]string
+	metrics	*system.Metrics
 }
 
 func NewStatusCommand(fs afero.Fs, mgr config.Manager) *cobra.Command {
 	var (
-		configFile string
-		send       bool
-		timeout    time.Duration
+		configFile	string
+		send		bool
+		timeout		time.Duration
 	)
 	command := &cobra.Command{
-		Use:          "status",
-		Short:        "Check the resource usage in the system, and optionally send it to Vectorized",
-		Long:         "",
-		SilenceUsage: true,
+		Use:		"status",
+		Short:		"Check the resource usage in the system, and optionally send it to Vectorized",
+		Long:		"",
+		SilenceUsage:	true,
 		RunE: func(ccmd *cobra.Command, args []string) error {
 			return executeStatus(fs, mgr, configFile, timeout, send)
 		},
@@ -85,9 +86,8 @@ func executeStatus(
 	if err != nil {
 		return err
 	}
-	config.CheckAndPrintNotice(conf.LicenseKey)
 	if !conf.Rpk.EnableUsageStats && send {
-		log.Warn("Usage stats reporting is disabled, so nothing will" +
+		log.Debug("Usage stats reporting is disabled, so nothing will" +
 			" be sent. To enable it, run" +
 			" `rpk config set rpk.enable_usage_stats true`.")
 	}
@@ -97,28 +97,66 @@ func executeStatus(
 	t.Append(getVersion())
 
 	providerInfoRowsCh := make(chan [][]string)
-	metricsRowsCh := make(chan [][]string)
+	osInfoRowsCh := make(chan [][]string)
+	cpuInfoRowsCh := make(chan [][]string)
 	confRowsCh := make(chan [][]string)
 	kafkaRowsCh := make(chan [][]string)
 
-	go getCloudProviderInfo(providerInfoRowsCh)
-	go getMetrics(fs, mgr, timeout, *conf, send, metricsRowsCh)
-	go getConf(mgr, conf.ConfigFile, confRowsCh)
-	go getKafkaInfo(*conf, kafkaRowsCh)
+	metricsRes, err := getMetrics(fs, mgr, timeout, *conf)
+	if err != nil {
+		// Retrieving the metrics is a prerequisite to sending them.
+		// Therefore, if that fails, return an error.
+		if send {
+			return err
+		}
+		// Otherwise, just log it. The rest of the info will still be
+		// shown to the user.
+		log.Infof("%v", err)
+	} else if send {
+		// If there was no error, send the metrics.
+		err := sendMetrics(*conf, metricsRes.metrics)
+		if err != nil {
+			return fmt.Errorf("Error sending metrics: %v", err)
+		}
+		return nil
+	}
 
-	for _, row := range <-providerInfoRowsCh {
-		t.Append(row)
-	}
-	for _, row := range <-metricsRowsCh {
-		t.Append(row)
-	}
-	for _, row := range <-confRowsCh {
-		t.Append(row)
-	}
-	for _, row := range <-kafkaRowsCh {
-		t.Append(row)
+	grp := multierror.Group{}
+	grp.Go(func() error {
+		return getCloudProviderInfo(providerInfoRowsCh)
+	})
+	grp.Go(func() error {
+		return getOSInfo(timeout, osInfoRowsCh)
+	})
+	grp.Go(func() error {
+		return getCPUInfo(cpuInfoRowsCh)
+	})
+	grp.Go(func() error {
+		return getConf(mgr, conf.ConfigFile, confRowsCh)
+	})
+	grp.Go(func() error {
+		return getKafkaInfo(*conf, kafkaRowsCh)
+	})
+	results := [][][]string{
+		metricsRes.rows,
+		<-osInfoRowsCh,
+		<-cpuInfoRowsCh,
+		<-providerInfoRowsCh,
+		<-confRowsCh,
+		<-kafkaRowsCh,
 	}
 
+	errs := grp.Wait().Errors
+	if errs != nil {
+		for _, err := range errs {
+			log.Info(err)
+		}
+	}
+	for _, rows := range results {
+		for _, row := range rows {
+			t.Append(row)
+		}
+	}
 	t.Render()
 
 	return nil
@@ -128,80 +166,76 @@ func getVersion() []string {
 	return []string{"Version", version.Pretty()}
 }
 
-func getCloudProviderInfo(out chan<- [][]string) {
+func getCloudProviderInfo(out chan<- [][]string) error {
 	v, err := cloud.AvailableVendor()
 	if err != nil {
-		log.Debug("Error initializing: ", err)
 		out <- [][]string{}
-		return
+		return errors.Wrap(err, "Error initializing")
 	}
 	rows := [][]string{{"Cloud Provider", v.Name()}}
 	vmType, err := v.VmType()
 	if err != nil {
-		log.Info("Error getting the VM type: ", err)
+		err = errors.Wrap(err, "Error getting the VM type")
 	} else {
 		rows = append(rows, []string{"Machine Type", vmType})
 	}
 	out <- rows
+	return err
 }
 
 func getMetrics(
-	fs afero.Fs,
-	mgr config.Manager,
-	timeout time.Duration,
-	conf config.Config,
-	send bool,
-	out chan<- [][]string,
-) {
+	fs afero.Fs, mgr config.Manager, timeout time.Duration, conf config.Config,
+) (*metricsResult, error) {
+	res := &metricsResult{[][]string{}, nil}
+	m, errs := system.GatherMetrics(fs, timeout, conf)
+	if len(errs) != 0 {
+		err := multierror.Append(nil, errs...)
+		return res, errors.Wrap(err, "Error gathering metrics")
+	}
+	res.metrics = m
+	res.rows = append(
+		res.rows,
+		[]string{"CPU Usage %", fmt.Sprintf("%0.3f", m.CpuPercentage)},
+		[]string{"Free Memory (MB)", fmt.Sprintf("%0.3f", m.FreeMemoryMB)},
+		[]string{"Free Space  (MB)", fmt.Sprintf("%0.3f", m.FreeSpaceMB)},
+	)
+	return res, nil
+}
+
+func getOSInfo(timeout time.Duration, out chan<- [][]string) error {
 	rows := [][]string{}
 	osInfo, err := system.UnameAndDistro(timeout)
 	if err != nil {
-		log.Info("Error querying OS info: ", err)
+		err = errors.Wrap(err, "Error querying OS info")
 	} else {
 		rows = append(rows, []string{"OS", osInfo})
 	}
+	out <- rows
+	return err
+}
+
+func getCPUInfo(out chan<- [][]string) error {
+	rows := [][]string{}
 	cpuInfo, err := system.CpuInfo()
 	if err != nil {
-		log.Info("Error querying CPU info: ", err)
+		err = errors.Wrap(err, "Error querying CPU info")
 	}
 	cpuModel := ""
 	if len(cpuInfo) > 0 {
 		cpuModel = cpuInfo[0].ModelName
 		rows = append(rows, []string{"CPU Model", cpuModel})
 	}
-	m, errs := system.GatherMetrics(fs, timeout, conf)
-	if len(errs) != 0 {
-		for _, err := range errs {
-			log.Debugf("Error gathering metrics: %v", err)
-		}
-	} else {
-		rows = append(
-			rows,
-			[]string{"CPU Usage %", fmt.Sprintf("%0.3f", m.CpuPercentage)},
-			[]string{"Free Memory (MB)", fmt.Sprintf("%0.3f", m.FreeMemoryMB)},
-			[]string{"Free Space  (MB)", fmt.Sprintf("%0.3f", m.FreeSpaceMB)},
-		)
-	}
-	if send {
-		if conf.NodeUuid == "" {
-			err := mgr.WriteNodeUUID(&conf)
-			if err != nil {
-				log.Info("Error writing the node's UUID: ", err)
-			}
-		}
-		err := sendMetrics(conf, m)
-		if err != nil {
-			log.Info("Error sending metrics: ", err)
-		}
-	}
 	out <- rows
+	return err
 }
 
-func getConf(mgr config.Manager, configFile string, out chan<- [][]string) {
+func getConf(
+	mgr config.Manager, configFile string, out chan<- [][]string,
+) error {
 	rows := [][]string{}
 	props, err := mgr.ReadFlat(configFile)
 	if err != nil {
-		log.Info("Error reading or parsing configuration: ", err)
+		err = errors.Wrap(err, "Error reading or parsing configuration")
 	} else {
 		keys := []string{}
 		for k := range props {
@@ -213,9 +247,10 @@ func getConf(mgr config.Manager, configFile string, out chan<- [][]string) {
 		}
 	}
 	out <- rows
+	return err
 }
 
-func getKafkaInfo(conf config.Config, out chan<- [][]string) {
+func getKafkaInfo(conf config.Config, out chan<- [][]string) error {
 	addr := fmt.Sprintf(
 		"%s:%d",
 		conf.Redpanda.KafkaApi.Address,
@@ -223,28 +258,26 @@ func getKafkaInfo(conf config.Config, out chan<- [][]string) {
 	)
 	client, err := kafka.InitClientWithConf(&conf, addr)
 	if err != nil {
-		log.Infof("Error initializing redpanda client: %s", err)
 		out <- [][]string{}
-		return
+		return errors.Wrap(err, "Error initializing redpanda client")
 	}
 	admin, err := sarama.NewClusterAdminFromClient(client)
 	if err != nil {
-		log.Infof("Error initializing redpanda client: %s", err)
 		out <- [][]string{}
-		return
+		return errors.Wrap(err, "Error initializing redpanda client")
 	}
 	defer admin.Close()
 	topics, err := topicsDetail(admin)
 	if err != nil {
-		log.Info("Error fetching the Redpanda topic details: ", err)
 		out <- [][]string{}
-		return
+		return errors.Wrap(err, "Error fetching the Redpanda topic details")
 	}
 	if len(topics) == 0 {
 		out <- [][]string{}
-		return
+		return nil
 	}
 	out <- getKafkaInfoRows(client.Brokers(), topics)
+	return nil
 }
 
 func getKafkaInfoRows(
@@ -254,8 +287,8 @@ func getKafkaInfoRows(
 	spacingRow := []string{"", ""}
 	type node struct {
 		// map[topic-name][]partitions
-		leaderParts  map[string][]int
-		replicaParts map[string][]int
+		leaderParts	map[string][]int
+		replicaParts	map[string][]int
 	}
 	nodePartitions := map[int]*node{}
 	for _, topic := range topics {
@@ -308,7 +341,7 @@ func getKafkaInfoRows(
 		}
 	}
 	nodeIDs := []int{}
-	for nodeID, _ := range nodePartitions {
+	for nodeID := range nodePartitions {
 		nodeIDs = append(nodeIDs, nodeID)
 	}
 	sort.Ints(nodeIDs)
@@ -360,9 +393,9 @@ func getKafkaInfoRows(
 
 func sendMetrics(conf config.Config, metrics *system.Metrics) error {
 	payload := api.MetricsPayload{
-		FreeMemoryMB:  metrics.FreeMemoryMB,
-		FreeSpaceMB:   metrics.FreeSpaceMB,
-		CpuPercentage: metrics.CpuPercentage,
+		FreeMemoryMB:	metrics.FreeMemoryMB,
+		FreeSpaceMB:	metrics.FreeSpaceMB,
+		CpuPercentage:	metrics.CpuPercentage,
 	}
 	return api.SendMetrics(payload, conf)
 }
@@ -373,7 +406,7 @@ func topicsDetail(admin sarama.ClusterAdmin) ([]*sarama.TopicMetadata, error) {
 		return nil, err
 	}
 	topicNames := []string{}
-	for name, _ := range topics {
+	for name := range topics {
 		topicNames = append(topicNames, name)
 	}
 	return admin.DescribeTopics(topicNames)
@@ -381,7 +414,7 @@ func topicsDetail(admin sarama.ClusterAdmin) ([]*sarama.TopicMetadata, error) {
 
 func formatTopicsAndPartitions(tps map[string][]int) string {
 	topicNames := []string{}
-	for topicName, _ := range tps {
+	for topicName := range tps {
 		topicNames = append(topicNames, topicName)
 	}
 	sort.Strings(topicNames)
